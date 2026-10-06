@@ -67,6 +67,8 @@ public class KategoriController : Controller
         kategori.UpdatedDate = null;
         kategori.AktifMi = true;
 
+        kategori.KullaniciId = _db.AktifKullaniciId;
+
         // ⭐ NULL alan için hiçbir özel işlem yok.
         //    ADO.NET'te şunu yazmak zorundaydık:
         //        (object?)kategori.Aciklama ?? DBNull.Value

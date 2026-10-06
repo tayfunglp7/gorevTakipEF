@@ -33,24 +33,83 @@ public class GorevController : Controller
     }
 
     // ══════════════════════════════════════════════════════
-    //  1) LİSTELEME
-    //  GET: /Gorev
-    //
-    //  (Filtreleme Modül 5'te eklenecek)
+    //  LİSTELEME + ARAMA + FİLTRE
+    //  GET: /Gorev?arama=rapor&kategoriId=2&durum=Beklemede&sadeceGecikmis=true
     // ══════════════════════════════════════════════════════
-    public async Task<IActionResult> Index()
+    public async Task<IActionResult> Index(
+        string? arama,
+        long? kategoriId,
+        GorevDurum? durum,
+        Oncelik? oncelik,
+        bool sadeceGecikmis = false)
     {
-        var gorevler = await _db.Gorevler
+        // ⭐ Bir kez al, her yerde kullan.
+        //    Hem parametre olarak gider hem de gece yarısı tutarsızlığını önler.
+        var bugun = DateTime.Today;
+
+        // ══════════════════════════════════════════════════
+        //  SORGUYU PARÇA PARÇA KUR
+        //
+        //  ⭐ Bu satırların HİÇBİRİ veritabanına gitmez.
+        //     Sadece "ne isteyeceğimizin tarifi" hazırlanır.
+        //     Son satırdaki ToListAsync() TEK sorgu çalıştırır.
+        // ══════════════════════════════════════════════════
+        IQueryable<Gorev> sorgu = _db.Gorevler
             .AsNoTracking()
-            .Include(g => g.Kategori)                        // JOIN
-                                                             // ⭐ KOŞULLU SIRALAMA — CASE WHEN'in LINQ karşılığı
-            .OrderBy(g => g.Durum == GorevDurum.Tamamlandi)  // tamamlananlar alta
-            .ThenByDescending(g => g.Oncelik)                // yüksek öncelik üste
-            .ThenBy(g => g.BitisTarihi == null)              // tarihsizler alta
-            .ThenBy(g => g.BitisTarihi)                      // yakın tarih üste
+            .Include(g => g.Kategori);
+
+        if (!string.IsNullOrWhiteSpace(arama))
+        {
+            string temizArama = arama.Trim();
+
+            // Başlık veya açıklamada ara
+            // ⚠️ Aciklama NULL olabilir — EF bunu SQL'de doğru ele alır,
+            //    NULL satırlar LIKE karşılaştırmasında elenir.
+            sorgu = sorgu.Where(g =>
+                g.Baslik.Contains(temizArama) ||
+                (g.Aciklama != null && g.Aciklama.Contains(temizArama)));
+        }
+
+        if (kategoriId.HasValue && kategoriId.Value > 0)
+            sorgu = sorgu.Where(g => g.KategoriId == kategoriId.Value);
+
+        if (durum.HasValue)
+            sorgu = sorgu.Where(g => g.Durum == durum.Value);
+
+        if (oncelik.HasValue)
+            sorgu = sorgu.Where(g => g.Oncelik == oncelik.Value);
+
+        if (sadeceGecikmis)
+        {
+            // ⭐⭐ BURASI KRİTİK
+            //
+            // ❌ sorgu.Where(g => g.GecikmisMi)
+            //    → "The LINQ expression could not be translated"
+            //
+            // ✅ GecikmisMi özelliğinin SQL'e çevrilebilir hâli:
+            sorgu = sorgu.Where(g => g.BitisTarihi != null
+                                  && g.BitisTarihi < bugun
+                                  && g.Durum != GorevDurum.Tamamlandi);
+        }
+
+        // Sıralama (Modül 4'ten aynen)
+        var liste = await sorgu
+            .OrderBy(g => g.Durum == GorevDurum.Tamamlandi)
+            .ThenByDescending(g => g.Oncelik)
+            .ThenBy(g => g.BitisTarihi == null)
+            .ThenBy(g => g.BitisTarihi)
             .ToListAsync();
 
-        return View(gorevler);
+        // ⭐ Filtre değerlerini geri gönder — form dolu kalsın
+        ViewBag.Arama = arama;
+        ViewBag.SeciliKategori = kategoriId;
+        ViewBag.SeciliDurum = durum;
+        ViewBag.SeciliOncelik = oncelik;
+        ViewBag.SadeceGecikmis = sadeceGecikmis;
+
+        await KategoriListesiniHazirlaAsync(kategoriId);
+
+        return View(liste);
     }
 
     // ══════════════════════════════════════════════════════
@@ -93,6 +152,9 @@ public class GorevController : Controller
         gorev.TamamlanmaTarihi = (gorev.Durum == GorevDurum.Tamamlandi)
             ? DateTime.Now
             : null;
+
+        // ⭐ SAHİBİ ATA
+        gorev.KullaniciId = _db.AktifKullaniciId;
 
         // ⚠️ gorev.Kategori navigasyon özelliği NULL — bu SORUN DEĞİL.
         //    EF, KategoriId alanına bakar. Kategori nesnesini de
@@ -218,5 +280,159 @@ public class GorevController : Controller
             return NotFound();
 
         return View(gorev);
+    }
+
+    // ══════════════════════════════════════════════════════
+    //  8) PASİF KAYITLAR
+    // ══════════════════════════════════════════════════════
+    public async Task<IActionResult> Pasifler()
+    {
+        var pasifler = await _db.Gorevler
+            .AsNoTracking()
+            .IgnoreQueryFilters()
+            .Include(g => g.Kategori)            // ⭐ soft delete filtresini atla
+            .Where(g => !g.AktifMi
+                     && g.KullaniciId == _db.AktifKullaniciId) // ⭐ KULLANICIYI ELLE EKLE
+            .OrderBy(g => g.Baslik)
+            .ToListAsync();
+
+        return View(pasifler);
+    }
+
+
+    // ══════════════════════════════════════════════════════
+    //  10) GÖREVİ GERİ YÜKLE
+    //  POST: /Gorev/GeriYukle/5
+    //
+    //  ⚠️ Adı "GeriAl" DEĞİL — Modül 5'te durum geri alma için
+    //     o adı kullanacağız. Sebebi yukarıda açıklandı.
+    // ══════════════════════════════════════════════════════
+    [HttpPost]
+    [ValidateAntiForgeryToken]
+    public async Task<IActionResult> GeriYukle(long id)
+    {
+        // ⚠️⚠️ IgnoreQueryFilters ŞART!
+        //    FindAsync(id) yazsaydık query filter devreye girer,
+        //    pasif kaydı BULAMAZDI ve hep NotFound() dönerdi.
+        var gorev = await _db.Gorevler
+            .IgnoreQueryFilters()
+            .FirstOrDefaultAsync(g => g.GorevId == id);
+
+        if (gorev == null)
+            return NotFound();
+
+        // ⭐ Zaten aktifse boşuna işlem yapma
+        if (gorev.AktifMi)
+        {
+            TempData["Uyari"] = "Bu görev zaten aktif.";
+            return RedirectToAction(nameof(Index));
+        }
+
+        // ⭐ Kategorisi silinmişse geri yükleme anlamsız olur —
+        //    görev listede görünmez çünkü Include, kategorinin
+        //    query filter'ını da uygular ve satır elenir.
+        bool kategoriAktif = await _db.Kategoriler
+            .AnyAsync(k => k.KategoriId == gorev.KategoriId);
+
+        if (!kategoriAktif)
+        {
+            TempData["Uyari"] = "Bu görevin kategorisi silinmiş. " +
+                                "Önce kategoriyi geri getirmelisiniz.";
+            return RedirectToAction(nameof(Pasifler));
+        }
+
+        gorev.AktifMi = true;
+        gorev.UpdatedDate = DateTime.Now;
+        await _db.SaveChangesAsync();
+
+        TempData["Basarili"] = "Görev geri getirildi.";
+        return RedirectToAction(nameof(Pasifler));
+    }
+
+    // ══════════════════════════════════════════════════════
+    //  HIZLI EYLEM: TAMAMLA
+    //  POST: /Gorev/Tamamla/5
+    // ══════════════════════════════════════════════════════
+    [HttpPost]
+    [ValidateAntiForgeryToken]
+    public async Task<IActionResult> Tamamla(long id, string? donusUrl = null)
+    {
+        // ⭐ TEK SORGU — nesneyi çekmiyoruz bile.
+        //    Dönüş değeri: kaç satır etkilendi?
+        int etkilenen = await _db.Gorevler
+            .Where(g => g.GorevId == id)
+            .ExecuteUpdateAsync(s => s
+                .SetProperty(g => g.Durum, GorevDurum.Tamamlandi)
+                .SetProperty(g => g.TamamlanmaTarihi, DateTime.Now)
+                .SetProperty(g => g.UpdatedDate, DateTime.Now));
+
+        if (etkilenen == 0)
+            return NotFound();
+
+        TempData["Basarili"] = "Görev tamamlandı.";
+        return GeriDon(donusUrl);
+    }
+
+    // ══════════════════════════════════════════════════════
+    //  HIZLI EYLEM: GERİ AL
+    //  POST: /Gorev/GeriAl/5
+    // ══════════════════════════════════════════════════════
+    [HttpPost]
+    [ValidateAntiForgeryToken]
+    public async Task<IActionResult> GeriAl(long id, string? donusUrl = null)
+    {
+        int etkilenen = await _db.Gorevler
+            .Where(g => g.GorevId == id)
+            .ExecuteUpdateAsync(s => s
+                .SetProperty(g => g.Durum, GorevDurum.Beklemede)
+                // ⭐ DİKKAT: null atarken tip belirtmek gerekir.
+                //    Sadece "null" yazsaydık derleyici hangi tip
+                //    olduğunu anlayamazdı.
+                .SetProperty(g => g.TamamlanmaTarihi, (DateTime?)null)
+                .SetProperty(g => g.UpdatedDate, DateTime.Now));
+
+        if (etkilenen == 0)
+            return NotFound();
+
+        TempData["Basarili"] = "Görev yeniden açıldı.";
+        return GeriDon(donusUrl);
+    }
+
+    // ══════════════════════════════════════════════════════
+    //  HIZLI EYLEM: BAŞLAT (devam ediyor yap)
+    //  POST: /Gorev/Baslat/5
+    // ══════════════════════════════════════════════════════
+    [HttpPost]
+    [ValidateAntiForgeryToken]
+    public async Task<IActionResult> Baslat(long id, string? donusUrl = null)
+    {
+        int etkilenen = await _db.Gorevler
+            .Where(g => g.GorevId == id)
+            .ExecuteUpdateAsync(s => s
+                .SetProperty(g => g.Durum, GorevDurum.DevamEdiyor)
+                .SetProperty(g => g.TamamlanmaTarihi, (DateTime?)null)
+                .SetProperty(g => g.UpdatedDate, DateTime.Now));
+
+        if (etkilenen == 0)
+            return NotFound();
+
+        TempData["Basarili"] = "Görev başlatıldı.";
+        return GeriDon(donusUrl);
+    }
+
+    // ══════════════════════════════════════════════════════
+    //  YARDIMCI: filtreli listeye geri dön
+    //
+    //  ⚠️ Url.IsLocalUrl kontrolü ŞART!
+    //     Kullanıcıdan gelen bir adrese yönlendirirken HER ZAMAN
+    //     bu kontrol yapılır — yoksa açık yönlendirme açığı olur.
+    //     (Modül 2'de giriş sonrası yönlendirmede de görmüştük.)
+    // ══════════════════════════════════════════════════════
+    private IActionResult GeriDon(string? donusUrl)
+    {
+        if (!string.IsNullOrEmpty(donusUrl) && Url.IsLocalUrl(donusUrl))
+            return Redirect(donusUrl);
+
+        return RedirectToAction(nameof(Index));
     }
 }
